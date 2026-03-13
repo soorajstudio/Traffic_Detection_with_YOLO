@@ -15,6 +15,76 @@ const defaultSettings = {
   backendUrl:        'http://localhost:5000',
 };
 
+// ── Demo simulation engine ──────────────────────────────────────
+// Generates realistic detection results when the Python backend is unavailable
+function generateDemoStats(filename, durationSec) {
+  const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const fps = [24, 25, 30][rand(0, 2)];
+  const totalFrames = Math.round(durationSec * fps);
+  const cars = rand(4, 28);
+  const trucks = rand(0, 8);
+  const buses = rand(0, 4);
+  const motorcycles = rand(0, 6);
+  const bicycles = rand(0, 3);
+  const pedestrians = rand(2, 15);
+  const trafficLights = rand(0, 3);
+  const animals = rand(0, 2);
+  const totalVehicles = cars + trucks + buses + motorcycles;
+  const vehiclesCrossed = rand(Math.floor(totalVehicles * 0.3), totalVehicles);
+  const vpm = durationSec > 0 ? Math.round((vehiclesCrossed / durationSec) * 60) : 0;
+  const density = vpm > 30 ? 'HIGH' : vpm > 12 ? 'MODERATE' : 'LOW';
+  const statusMap = { HIGH: 'Heavy Traffic Detected', MODERATE: 'Moderate Traffic Flow', LOW: 'Light Traffic Conditions' };
+  const avgSpeed = rand(18, 65);
+  const maxSpeed = avgSpeed + rand(10, 40);
+  const mins = Math.floor(durationSec / 60);
+  const secs = Math.round(durationSec % 60);
+  return {
+    cars, pedestrians, trucks, buses, motorcycles, bicycles,
+    traffic_lights: trafficLights, animals,
+    avg_speed: avgSpeed, max_speed: maxSpeed,
+    vehicles_crossed_line: vehiclesCrossed,
+    vehicles_per_minute: vpm,
+    traffic_density: density,
+    traffic_status: statusMap[density],
+    duration: `${mins}m ${secs}s`,
+    resolution: ['1280×720', '1920×1080', '854×480'][rand(0, 2)],
+    fps, total_frames: totalFrames,
+    filename, processedAt: new Date().toLocaleString(),
+  };
+}
+
+function runDemoSimulation({ file, onProgress, onFrame, onComplete }) {
+  let cancelled = false;
+  const totalFakeFrames = 120 + Math.floor(Math.random() * 180);
+  let frame = 0;
+  const interval = setInterval(() => {
+    if (cancelled) return;
+    frame += Math.floor(Math.random() * 4) + 1;
+    if (frame >= totalFakeFrames) frame = totalFakeFrames;
+    const pct = Math.min((frame / totalFakeFrames) * 100, frame >= totalFakeFrames ? 100 : 99);
+    onProgress(pct);
+    onFrame(frame, totalFakeFrames);
+    if (frame >= totalFakeFrames) {
+      clearInterval(interval);
+      // Determine approximate duration from the video file
+      const video = document.createElement('video');
+      video.preload = 'metadata';
+      video.onloadedmetadata = () => {
+        const dur = video.duration || 10;
+        URL.revokeObjectURL(video.src);
+        const stats = generateDemoStats(file.name, dur);
+        onComplete(stats);
+      };
+      video.onerror = () => {
+        const stats = generateDemoStats(file.name, 15);
+        onComplete(stats);
+      };
+      video.src = URL.createObjectURL(file);
+    }
+  }, 50);
+  return () => { cancelled = true; clearInterval(interval); };
+}
+
 function applySettings(settings) {
   const r = document.documentElement;
   r.setAttribute('data-theme',    settings.theme);
@@ -85,14 +155,20 @@ function ProcessingOverlay({ progress, frameCount, totalFrames, style }) {
 }
 
 // ── Analysis panel ───────────────────────────────────────────────
-function AnalysisPanel({ analysis, videoUrl }) {
+function AnalysisPanel({ analysis, videoUrl, demo }) {
   const trafficColor = analysis.traffic_density === 'HIGH' ? '#f87171' : analysis.traffic_density === 'MODERATE' ? '#f59e0b' : '#34d399';
   return (
     <div className="analysis-panel anim-fadein">
       <div className="analysis-header">
-        <span className="analysis-title">DETECTION REPORT</span>
+        <span className="analysis-title">DETECTION REPORT{demo ? ' · DEMO' : ''}</span>
         <span className="analysis-time">{analysis.processedAt}</span>
       </div>
+      {demo && (
+        <div className="demo-banner">
+          <span className="demo-banner-icon">&#9432;</span>
+          <span>Demo mode — backend offline. Results are simulated. Run <code>python app.py</code> locally for real YOLOv8 detection.</span>
+        </div>
+      )}
       <div className="analysis-video-wrap">
         <video src={videoUrl} autoPlay loop muted controls className="analysis-video" />
         <div className="analysis-video-badge">● ANNOTATED OUTPUT</div>
@@ -493,6 +569,7 @@ export default function App() {
   const [currentResult, setCurrentResult] = useState(null);
   const [historyModal, setHistoryModal]   = useState(null);
   const [dragOver, setDragOver]           = useState(false);
+  const [demoMode, setDemoMode]           = useState(false);
   const [logLines, setLogLines]           = useState([
     'SYSTEM BOOT COMPLETE','YOLOv8n WEIGHTS LOADED',
     'FLASK SERVER CONNECTED','AWAITING VIDEO INPUT...',
@@ -500,6 +577,7 @@ export default function App() {
 
   const fileInputRef = useRef(null);
   const sseRef       = useRef(null);
+  const demoCancelRef = useRef(null);
 
   // Apply initial settings on mount
   useEffect(() => { applySettings(settings); }, []);
@@ -528,23 +606,48 @@ export default function App() {
     setIsProcessing(true); setProgress(0); setFrameCount(0); setTotalFrames(0); setLiveJpeg(null);
     addLog('CHECKING SERVER CONNECTION...');
 
-    // ── Step 0: health check ──────────────────────────────────────
+    // ── Step 0: health check — fall back to demo mode if unreachable ──
+    let useDemo = false;
     try {
       const ping = await fetch(`${settings.backendUrl}/health`, { signal: AbortSignal.timeout(4000) });
       if (!ping.ok) throw new Error('Server returned error');
       const h = await ping.json();
       addLog(`SERVER OK  device=${h.device}  tracker=${h.tracker ? 'ByteTrack' : 'predict'}`);
     } catch (e) {
-      setIsProcessing(false);
-      addLog(`ERROR  Cannot reach ${settings.backendUrl}`);
-      alert(
-        `Cannot reach the Flask server at ${settings.backendUrl}\n\n` +
-        `Make sure app.py is running:\n  python app.py\n\n` +
-        `Then check the backend URL in Settings matches.\n(Got: ${e.message})`
-      );
+      useDemo = true;
+      setDemoMode(true);
+      addLog('BACKEND OFFLINE — ENTERING DEMO MODE');
+      addLog('SIMULATING YOLOv8n DETECTION...');
+    }
+
+    if (useDemo) {
+      // ── Demo simulation path ────────────────────────────────────────
+      const savedName = selectedFile.name;
+      const savedPreview = previewUrl;
+      const savedFile = selectedFile;
+      demoCancelRef.current = runDemoSimulation({
+        file: savedFile,
+        onProgress: (pct) => setProgress(pct),
+        onFrame: (frame, total) => { setFrameCount(frame); setTotalFrames(total); },
+        onComplete: (stats) => {
+          setProgress(100);
+          const analysis = { ...stats, filename: savedName, processedAt: new Date().toLocaleString() };
+          // Use original video as the "annotated" output in demo mode
+          const videoUrl = savedPreview;
+          const newItem = { id: Date.now(), name: savedName, url: videoUrl, analysis, demo: true };
+          setCurrentResult({ url: videoUrl, analysis, demo: true });
+          setVideoHistory(prev => [newItem, ...prev]);
+          addLog('DEMO DETECTION COMPLETE');
+          addLog(`CARS: ${analysis.cars}  PEDS: ${analysis.pedestrians}`);
+          addLog(`TRAFFIC: ${analysis.traffic_status}  FLOW: ${analysis.vehicles_per_minute}/min`);
+          setSelectedFile(null); setPreviewUrl(null); setShowLivePreview(false);
+          setIsProcessing(false);
+        },
+      });
       return;
     }
 
+    // ── Real backend path ─────────────────────────────────────────────
     addLog('UPLOADING VIDEO...');
     const formData = new FormData();
     formData.append('video', selectedFile);
@@ -597,7 +700,7 @@ export default function App() {
     }
   };
 
-  useEffect(() => { return () => { sseRef.current?.close(); }; }, []);
+  useEffect(() => { return () => { sseRef.current?.close(); demoCancelRef.current?.(); }; }, []);
 
   const now=new Date();
   const timeStr=now.toTimeString().slice(0,8);
@@ -629,7 +732,7 @@ export default function App() {
         <div className="topbar-meta">
           <span className="meta-clock">{dateStr} · {timeStr}</span>
           <span className={`meta-status ${isProcessing?'meta-status--busy':''}`}>
-            {isProcessing?`⬤ PROCESSING ${Math.round(progress)}%`:'⬤ READY'}
+            {isProcessing?`⬤ PROCESSING ${Math.round(progress)}%`:demoMode?'⬤ DEMO MODE':'⬤ READY'}
           </span>
         </div>
       </header>
@@ -704,7 +807,7 @@ export default function App() {
                   {isProcessing && <ProcessingOverlay progress={progress} frameCount={frameCount} totalFrames={totalFrames} style={settings.progressStyle} />}
                 </div>
               )}
-              {currentResult && !isProcessing && <AnalysisPanel analysis={currentResult.analysis} videoUrl={currentResult.url} />}
+              {currentResult && !isProcessing && <AnalysisPanel analysis={currentResult.analysis} videoUrl={currentResult.url} demo={currentResult.demo} />}
               <div className="feed-actions">
                 <button className="btn btn-ghost" onClick={()=>{fileInputRef.current.click();setCurrentResult(null);}} disabled={isProcessing}>
                   {currentResult?'⟳  Process Another':'⟳  Change Video'}
